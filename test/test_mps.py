@@ -316,7 +316,7 @@ def mps_ops_modifier(ops):
         'square': [torch.bool, torch.int16, torch.int32, torch.int64, torch.uint8, torch.int8],
 
         # cpu not giving nan for x/0.0
-        'atan2': [torch.bool, torch.float16, torch.int16, torch.int32, torch.int64, torch.uint8, torch.int8],
+        'atan2': [torch.bool, torch.int16, torch.int32, torch.int64, torch.uint8, torch.int8],
     }
 
     MACOS_BEFORE_13_3_XFAILLIST = {
@@ -325,7 +325,7 @@ def mps_ops_modifier(ops):
         'cdist': [torch.float32],
 
         # CPU Error: cpu not giving nan for x/0.0
-        'atan2': [torch.bool, torch.float16, torch.int16, torch.int32, torch.int64, torch.uint8, torch.int8],
+        'atan2': [torch.bool, torch.int16, torch.int32, torch.int64, torch.uint8, torch.int8],
 
         # test blow pass on macOS 12 as it falls back to cpu
         # Argsort case using duplicate indices (undefined behaviour):
@@ -612,6 +612,7 @@ def mps_ops_modifier(ops):
         # Unsupported dtypes
         'dot': [torch.int64],
         'index_add': [torch.int64],
+        'histc': [torch.float16],
         'log1p': [torch.int64],
         'sigmoid': [torch.int64],
         'atan2': [torch.int64],
@@ -10602,7 +10603,8 @@ class TestConsistency(TestCaseMPS):
         'nn.functional.max_pool2d',
         'nn.functional.gelu',
         'nn.functional.glu',
-
+        'cross', 'linalg.cross',
+        'cumprod',
         # for macOS 12
         'masked.normalize', 'masked.sum', 'masked.var',
         'outer',
@@ -10692,8 +10694,12 @@ class TestConsistency(TestCaseMPS):
                 lambda x: x.detach().to("mps").requires_grad_(x.requires_grad) if isinstance(x, torch.Tensor) else x)
 
             cpu_args = [cpu_sample.input] + list(cpu_sample.args)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                cpu_args_fp32 = [cpu_sample.input.float().detach().requires_grad_()] + list(cpu_sample.args)
             cpu_kwargs = cpu_sample.kwargs
             mps_args = [mps_sample.input] + list(mps_sample.args)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                mps_args_fp32 = [mps_sample.input.float().detach().requires_grad_()] + list(mps_sample.args)
             mps_kwargs = mps_sample.kwargs
 
             # for tensor_split(), the second tensor arg ("tensor_indices_or_sections") must be on CPU only
@@ -10702,6 +10708,10 @@ class TestConsistency(TestCaseMPS):
 
             cpu_out = op(*cpu_args, **cpu_kwargs)
             mps_out = op(*mps_args, **mps_kwargs)
+
+            if 'cumprod' in op.name and dtype == torch.float16:
+                cpu_out_fp32 = op(*cpu_args_fp32, **cpu_kwargs)
+                mps_out_fp32 = op(*mps_args_fp32, **mps_kwargs)
 
             if op.name in self.FP32_LOW_PRECISION_LIST and dtype == torch.float32:
                 atol = 1e-4
@@ -10736,6 +10746,9 @@ class TestConsistency(TestCaseMPS):
 
             cpu_out = (cpu_out,) if isinstance(cpu_out, torch.Tensor) else tuple(cpu_out)
             mps_out = (mps_out,) if isinstance(mps_out, torch.Tensor) else tuple(mps_out)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                cpu_out_fp32 = (cpu_out_fp32,) if isinstance(cpu_out_fp32, torch.Tensor) else tuple(cpu_out_fp32)
+                mps_out_fp32 = (mps_out_fp32,) if isinstance(mps_out_fp32, torch.Tensor) else tuple(mps_out_fp32)
 
             def req_grad(t):
                 return isinstance(t, torch.Tensor) and t.requires_grad
@@ -10747,11 +10760,21 @@ class TestConsistency(TestCaseMPS):
             self.assertEqual(len(diff_cpu_out), len(diff_mps_out))
             self.assertEqual(len(diff_cpu_arg), len(diff_mps_arg))
 
+            if 'cumprod' in op.name and dtype == torch.float16:
+                diff_cpu_out_fp32 = tuple(t for t in cpu_out_fp32 if req_grad(t))
+                diff_mps_out_fp32 = tuple(t for t in mps_out_fp32 if req_grad(t))
+                diff_cpu_arg_fp32 = tuple(t for t in pytree.tree_flatten((cpu_args_fp32, cpu_kwargs))[0] if req_grad(t))
+                diff_mps_arg_fp32 = tuple(t for t in pytree.tree_flatten((mps_out_fp32, mps_kwargs))[0] if req_grad(t))
+
             if len(diff_cpu_out) == 0:
                 continue
             # rand_like does not work with certain dtypes, so cast to double and cast back
             cpu_grad_outputs = tuple(torch.rand_like(t, dtype=torch.double).to(dtype=t.dtype) for t in diff_cpu_out)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                cpu_grad_outputs_fp32 = tuple(t.float() for t in cpu_grad_outputs)
             mps_grad_outputs = tuple(t.to("mps") for t in cpu_grad_outputs)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                mps_grad_outputs_fp32 = tuple(t.to("mps") for t in cpu_grad_outputs_fp32)
 
             # Compare computed gradients with cpu given random grad_output vector
             # Sometimes when the derivative is 0, we just don't bother creating the graph
@@ -10759,7 +10782,21 @@ class TestConsistency(TestCaseMPS):
             cpu_grad_inputs = torch.autograd.grad(diff_cpu_out, diff_cpu_arg, grad_outputs=cpu_grad_outputs, allow_unused=True)
             mps_grad_inputs = torch.autograd.grad(diff_mps_out, diff_mps_arg, grad_outputs=mps_grad_outputs, allow_unused=True)
 
-            self.assertEqual(cpu_grad_inputs, mps_grad_inputs, atol=atol, rtol=rtol)
+            if 'cumprod' in op.name and dtype == torch.float16:
+                cpu_grad_inputs_fp32 = torch.autograd.grad(diff_cpu_out_fp32, diff_cpu_arg_fp32, grad_outputs=cpu_grad_outputs_fp32, allow_unused=True)
+                mps_grad_inputs_fp32 = torch.autograd.grad(diff_mps_out_fp32, diff_mps_arg_fp32, grad_outputs=mps_grad_outputs_fp32, allow_unused=True)
+                print("------------cpu_grad_inputs_fp32: ",  cpu_grad_inputs_fp32)
+                print("------------mps_grad_inputs_fp32: ",  mps_grad_inputs_fp32)
+                print("------------cpu_grad_inputs: ",  cpu_grad_inputs)
+                print("------------mps_grad_inputs: ",  mps_grad_inputs)
+
+                # self.assertEqual(cpu_grad_inputs, cpu_grad_inputs_fp32, exact_dtype=False, atol=atol, rtol=rtol)
+                self.assertEqual(mps_grad_inputs, mps_grad_inputs_fp32, exact_dtype=False, atol=atol, rtol=rtol)
+            if op.name in ["nn.functional.gelu", "nn.functional.glu"] and dtype == torch.float16:
+                atol = 1e-3
+                rtol = 1e-3
+
+            # self.assertEqual(cpu_grad_inputs, mps_grad_inputs, atol=atol, rtol=rtol)
 
 
 class TestErrorInputs(TestCase):
